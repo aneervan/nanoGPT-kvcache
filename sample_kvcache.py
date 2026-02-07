@@ -9,6 +9,7 @@ import tiktoken
 import argparse
 import sys
 import time 
+from kvcache_store import KVCacheStore
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
@@ -81,29 +82,55 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
+def normalize_prompts(prompts):
+    if isinstance(prompts, (list, tuple)):
+        return list(prompts)
+    return [prompts]
 
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-x = torch.cat([x, x], dim=0)
+
+def load_prompt_text(prompt):
+    if isinstance(prompt, str) and prompt.startswith('FILE:'):
+        with open(prompt[5:], 'r', encoding='utf-8') as f:
+            return f.read()
+    return prompt
+
+
+def encode_prompt(prompt):
+    prompt = load_prompt_text(prompt)
+    if isinstance(prompt, str):
+        return encode(prompt)
+    if isinstance(prompt, torch.Tensor):
+        return prompt.tolist()
+    return list(prompt)
+
+
+prompts = normalize_prompts(start)
+kvcache_store = KVCacheStore()
 
 # run generation
 with torch.no_grad():
     with ctx:
-        start = time.time_ns()
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            # POC - batch inference works
-            print("Gen 1\n*****\n")
-            print(decode(y[0].tolist()))
-            print("Gen length -", len(y[0].tolist()))
-            print("Gen 2\n*****\n")
-            print(decode(y[1].tolist()))
-            print("Gen length -", len(y[1].tolist()))
-            print('---------------')
+        start_time = time.time_ns()
+        for prompt in prompts:
+            prompt_ids = encode_prompt(prompt)
+            x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, ...]
+            cached_kvcache = kvcache_store.get(prompt_ids, device=device)
+            if cached_kvcache is None:
+                _, _, kvcache = model(x)
+                kvcache_store.add(prompt_ids, kvcache)
+                cached_kvcache = kvcache_store.get(prompt_ids, device=device)
+            for _ in range(num_samples):
+                y = model.generate(
+                    x,
+                    max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    kvcache=cached_kvcache,
+                )
+                print("Gen\n*****\n")
+                print(decode(y[0].tolist()))
+                print("Gen length -", len(y[0].tolist()))
+                print('---------------')
         end = time.time_ns()
 
-print(f'{(end-start)/1_000_000}ms')
+print(f'{(end-start_time)/1_000_000}ms')
